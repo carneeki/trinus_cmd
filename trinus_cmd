@@ -1,0 +1,1550 @@
+#!/usr/bin/perl
+
+#   TRINUS 3D Printer console tool.
+#   Mike Nix <trinus-acct@wanm.com.au>
+#
+#   Provides much the same features as the Pango Console, but also
+#   some basic laser tests and the ability to send a gcode file to 
+#   the printer.
+#
+#   Things we can not do as the firmware doesn't support it:
+#       Store a file on the SD card
+#       ?? other things ??
+#
+#   On Windows you may need to install
+#       Gtk2, Glib
+
+use strict;
+use Carp;
+use warnings;
+use Gtk2;
+use Glib;
+use Time::HiRes qw/time sleep usleep gettimeofday tv_interval/;
+use File::Basename;
+#use Sort::Naturally; # for ncmp, but we now have a cut down version specfic to gcodes
+use constant { FALSE=>0, TRUE=>1 };
+use constant { SS_NONE=>0, SS_NEXT=>1, SS_WAIT=>2,
+               SS_QUEUE_NEXT=>3, SS_QUEUE_WAIT=>4, SS_QUEUE_SLEEP=>5 
+             };
+use constant { DEFAULT_TIMEOUT=>3.0, CMD_TIMEOUT=>120 };
+
+
+our %known_commands=( # See also the 'Trinus Interop' doc on Google Docs
+       G0=>['{s:axe}{f:value}','Fast Move'],
+       G1=>['{s:axe}{f:value}* E{f:extr} F{d:feed}','Move with feed'],
+       G2=>['','CW Arc as per gcode standard.'],
+       G3=>['','CCW Arc. Not implemented'],
+       G4=>['P{d:ms}','Delay ms milliseconds'], ## updated
+       G10=>['','tool offset?'],
+       G28=>['{s:axe}*','Home Axes: X,Y,Z or nothing for all'],
+       G90=>['','Absolute co-ordinate mode'],
+       G91=>['','Relative co-ordinate mode'],
+       G92=>['{s:axe}*','Reset position to value'],
+
+       M17=>['',''],
+       M20=>['','List SD Contents'],
+       M23=>['{s:filename}','Select SD card file'],
+       M24=>['','Start/Resume SD sprint'],
+       M25=>['','Pause SD Print'],
+       M27=>['','Report SD Print Status'],
+       M52=>['','Resume SD Print'],
+       M53=>['','Stop SD Print'],
+       M84=>['XYZE','Disable'],		## updated, notfound
+       M104=>['S{d:temp}','Set Extruder Temp'], ## notfound
+       M105=>['','Get Temps'],
+       M106=>['S{d:pwm}','Set fan speed'],
+       M107=>['','Fan off?'],		## updated
+       M108=>['','Break waiting for temp'],
+       M109=>['S{d:temp} R{d:maxtemp}','Wait for extruder temp setting'],
+       M110=>['N{d:lineno}','Set current line number'],
+       M114=>['','Get current position'],
+       M115=>['','Get firmware version'],
+       M117=>['{s:msg}','Display/echo message'],
+       M130=>['','Set P error'],
+       M131=>['','Set I error'],
+       M132=>['','Set D error'],
+       M140=>['S{d:temp}','Set heated bed temperature'],
+       M190=>['S{d:temp}','Set heated bed temp and wait'],
+       M200=>['S{d:percent}','Set progress indicator to percent'],
+       M206=>['',''],
+       M220=>['S{d:percent}','Set speed factor (0..100 percent or highter. max=500)'],
+       M221=>['S{d:percent}','Set extruder speed factor (0..100 percent or higher)'],
+       M302=>['','???'],
+       M303=>['','???'],
+       M304=>['','Set PID values error'],
+       M400=>['','Wait for current moves to finish?'],
+       M401=>['','???'],
+       M500=>['[F{1|2}]','Get model/bed dimensions, F1 or F2 sets the model'],
+       M501=>['[D{2|3}]','Get driver model, D2 or D3 sets the driver model'],
+       M504=>['','Get high speed step units?'],
+       M505=>['','Get high speed step units?'],
+       M507=>['','Get high speed step units?'],
+       M610=>['','??'],
+       M628=>['{s:axe}{f:value}*','Set zero offsets on axes'],
+       M629=>['C{0|1}','Set System Mode: 0=LASER, 1=FDM'], # updated
+       M630=>['C{0|1}','Set Laser 0=Off, 1=On (Diagnostics only)'], # updated
+       M631=>['S0','Select flash file for LASER'],         # updated
+       M632=>['','Get print job status'],
+       M650=>['S{d:x} W0','S->[ECHO] Responder of Serial2 set to x,   W->External reset'],
+       );
+
+
+our $debug=0;
+our $devmode=0;
+our $lastcmd='';
+our $scan_printall=1;
+our $scan_goterror=0;
+our $send_checksums=1;
+our $gui_out=1;
+
+my $port='/dev/ttyUSB0';
+$port='\\\\.\\COM1' if $^O eq "MSWin32";
+
+my @cmd_queue=();
+my $cmd_queue_init_delay = '+2';
+
+our $openscreen   = \&openscreen_ascii;
+our $closescreen  = \&closescreen_ascii;
+our $status       = \&status_ascii;
+our $message      = \&message_ascii;
+our $errormessage = \&errormessage_ascii;
+our $yield        = sub { check_rx(); usleep(1); };
+
+our $cmd_combo_isup=0;
+our $in_check_rx=0;
+our $ss_wait_start=0;
+our $last_status_update=0;
+our $last_progress_update=0; # time last progress request (M105) was made
+our ($displaywin, $messagewin, $statuswin, $scancommands_btn, $cmd_combo);
+our $scanstate=SS_NONE;
+
+our @response_queue=();
+our %printer_status;
+
+my ($head_x, $head_y, $head_z, $head_e)=(0,0,0,0);
+
+##### Read the ini file
+my $inifile=dirname($0).'/trinus_cmd.ini';
+if (-f $inifile) {
+   my $ini;
+   open($ini, $inifile);
+   while (<$ini>) {
+      s/\#.*//;
+      s/[\r\n]//g;
+      s/\s+$//;
+      if (length($_)==0) { }
+      elsif (/^port=(.+)/) { $port=$1; }
+      elsif (/^devmode=(.+)/) { $devmode=$1; }
+      elsif (/^(G|M)(.+)/) {
+         my $c = $1.$2;
+         qcmd($cmd_queue_init_delay) if $#cmd_queue<0;
+         push(@cmd_queue, $c);
+         }
+      else {
+         printf("Unknown entry in %s:'%s'\n", $inifile, $_);
+         }
+      }
+   close($ini);
+   }
+
+##### Handle command line options
+while ($ARGV[0]) {
+   if ($ARGV[0] eq '-pc') {
+      print_known_commands();
+      exit(0);
+      }
+   elsif ($ARGV[0] eq '-p') {
+      shift;
+      $port = $ARGV[0];
+      }
+   elsif ($ARGV[0] eq '-f') {
+      shift;
+      
+      read_gcode_file($ARGV[0]) || die("Failed to read ".$ARGV[0]);
+      }
+   elsif ($ARGV[0] eq '-h') {
+      printf("Usage: %s [params]\n", $0);
+      printf("	-pc		List known commands and exit.\n");
+      printf("	-p dev		Serial port for your Trinus Printer\n");
+      printf("	-f file		Send gcode file to printer\n");
+      printf("	'cmd'		Send command 'cmd' to the printer\n");
+      printf("\n");
+      printf("Repeat -f file and 'cmd' as needed\n");
+      exit(0);
+      }
+   else {
+      qcmd($cmd_queue_init_delay) if $#cmd_queue<0;
+      push(@cmd_queue, $ARGV[0]);
+      }
+   shift;
+   }
+
+
+##### Open UI and do Main Loop
+if ($gui_out) {
+   $openscreen   = \&openscreen_gtk2;
+   $closescreen  = \&closescreen_gtk2;
+   $status       = \&status_gtk2;
+   $message      = \&message_gtk2;
+   $errormessage = \&errormessage_gtk2;
+   }
+
+&$openscreen();
+
+my $baud=115200;
+my $trinus = openport($port, $baud);
+
+if ($gui_out) {
+   $scanstate=SS_NONE unless defined($trinus);
+   Gtk2->main;
+   }
+else {
+   my ($c,$rsp);
+
+   if (!$trinus) {
+      printf("Error opening %s\n", $port);
+      exit(2);
+      }
+
+   # allow time for the printer to see our connection and send 
+   # misc data about itself
+   sleep(2);
+   # read the data...
+   $rsp = $trinus->lookfor;
+   while ($rsp ne '') {
+      print $rsp,"\n" if $rsp ne '';
+      $rsp = $trinus->lookfor;
+      }
+   print $rsp,"\n" if $rsp ne '';
+      
+   # from now on we will get 'ok' when the printer is ready for more data
+   $c = get_cmd();
+   while ($c ne 'quit' && $c ne 'exit') {
+      cmd($c);
+      $rsp = $trinus->lookfor;
+      while ($rsp !~ /^ok/i) {
+         print $rsp,"\n" if $rsp ne '';
+         $rsp = $trinus->lookfor;
+         }
+      print $rsp,"\n" if $rsp ne '';
+      $c = get_cmd();
+      }
+   }
+
+$trinus=closeport($trinus);
+&$closescreen();
+
+###
+
+sub read_gcode_file
+{ my ($fn)=@_;
+  my %badcodes;
+  my @gcode;
+  my $has_progress=0;
+      
+  open (my $gc, "<", $fn) || return 0;
+  &$message("Reading %s\n", $fn);
+
+  # insert regular progress updates
+  # have to read the entire file then push it once we know the size.
+  # Not all that accurate because commands take different amounts of time
+  # but gives a rough idea how much of the file has been processed.
+  
+  # TODO: How do we start the timer??
+  
+  while (<$gc>) {
+          chomp();
+          s/\r$//;
+          s/;.*$//; # trim comments - the firmware doesn't like them
+          s/\s+$//; # trim whitespace at end
+          if ( /^([A-Z])(\d{1,4})/ ) {
+             my $c=$1.$2;
+             # only accept known commands so we don't get errors from the printer
+             # The queue processor will abort if it gets an error from the printer
+             $has_progress=1 if $c eq "M200";
+             if (defined($known_commands{$c})) {
+                push(@gcode, $_);
+                }
+             elsif (!defined($badcodes{$c})) {
+                &$message("Warning: Unrecognised G code skipped: %s\n", $_);
+                $badcodes{$c}=1;
+                }
+             }
+          }
+  close($gc);
+
+  qcmd($cmd_queue_init_delay) if $#cmd_queue<0; # pause to let trinus init serial connection. 
+                                                # (also will trigger queue to start running)
+  qcmd("M200 S0") unless $has_progress;         # show 0% complete
+  my $mod = $#gcode / 100;                      # update progress every 1%
+  $mod = 20 if $mod<20;                         # or at most every 20 commands
+  foreach my $i (0..$#gcode) {
+      push(@cmd_queue, $gcode[$i]);
+      if (($i % $mod) == 0) {
+         push(@cmd_queue, sprintf("M200 S%d", $i*100/$#gcode)) unless $has_progress;
+         }
+      }
+  qcmd("M200 S100") unless $has_progress; # show 100% complete
+  return 1;
+}
+
+sub wait_response
+{ my ($pattern, $timeout)=@_;
+  my $start = [gettimeofday];
+  my $rsp;
+  my @data=();
+  $timeout=DEFAULT_TIMEOUT if !defined($timeout);
+  
+  while (!$rsp && (tv_interval($start) < $timeout)) {
+     if ($#response_queue>=0) {
+        $rsp = shift @response_queue;
+        push @data, $rsp;
+        $rsp = undef unless $rsp =~ /$pattern/;
+        }
+     else {
+        &$yield();
+        }
+     }
+  if (defined($rsp)) {
+     return wantarray ? @data : $rsp;
+     }
+  &$errormessage("Wait_response: timeout after %1.4f\n", tv_interval($start)) if $debug>2;
+  return undef;
+}
+
+sub get_cmd
+{
+  my $c;
+  if (0 < scalar @cmd_queue) {
+     $c = shift(@cmd_queue);
+     printf(">%s\n", $c);
+     }
+  else {
+     print(">");
+     $c = <>;
+     $c =~ s/[\r\n]//g;
+     }
+  return $c;
+}
+
+sub cmd
+{ my ($s)=@_;
+  my $sum = 0;
+  my $c;
+  return unless defined($trinus);
+  return unless $s ne '';
+  for my $i (0..length($s)-1) {
+      $sum = $sum ^ ord(substr($s, $i, 1));
+      }
+  if ($send_checksums && $s !~ /^M23/) {
+     $c=sprintf("%s*%d\r\n", $s, $sum & 0xFF);
+     }
+  else {
+     $c=sprintf("%s\r\n", $s);
+     }
+  $c=substr($c,0); # workaround for utf8 bug with Win32::SerialPort
+  &$message(">>>%s",$c);
+  $lastcmd=$s;
+  $trinus->write($c);
+}
+
+sub qcmd
+{ my ($s)=@_;
+  push @cmd_queue, $s;
+  if ($scanstate==SS_NONE) {
+     $scanstate=SS_QUEUE_NEXT;
+     #&$errormessage("Scan State: SS_QUEUE_NEXT via qcmd\n");
+     }
+}
+
+sub icmd
+{ my ($s)=@_;
+  unshift @cmd_queue, $s;
+  if ($scanstate==SS_NONE) {
+     $scanstate=SS_QUEUE_NEXT;
+     #&$errormessage("Scan State: SS_QUEUE_NEXT via icmd\n");
+     }
+}
+
+# compare two gcodes for sorting purposes
+sub ncmp
+{ my ($a, $b)=@_;
+  my $rc= substr($a,0,1) cmp substr($b,0,1);
+  return $rc if $rc;
+  return substr($a,1) <=> substr($b,1);
+}
+
+sub print_known_commands
+{
+  printf("Known Commands:\n");
+  foreach my $c (sort { ncmp($a,$b) } keys %known_commands) {
+     printf("%-4s %-20s %s\n", $c, $known_commands{$c}[0], $known_commands{$c}[1]);
+     }
+}
+
+
+#[VALUE] T:20.5/0.0 B:19.0/0.0 S:0 F:'' P:-1 I:0 D:100 E:100
+# and similar lines....
+sub decode_status
+{ my ($st, $values, $prefix)=@_;
+  $prefix='' unless defined($prefix);
+  if ($st =~ /^\[VALUE\]( .*)$/) {
+     my $data = $1;
+     while ($data =~ / ([A-Z]):(\S+)/g ) {
+        $values->{$prefix.$1}=$2;
+        $values->{'_updated'}=1;
+        }
+     }
+}
+
+#[VALUE] x=y
+sub decode_value
+{ my ($st, $values, $prefix)=@_;
+  $prefix='' unless defined($prefix);
+  if ($st =~ /^\[VALUE\] (.*?)=(.*+)$/ ) {
+     $values->{$prefix.$1}=$2;
+     $values->{'_updated'}=1;
+     }
+}
+
+sub get_value
+{ my ($v, $fmt)=@_;
+  return '' unless defined($printer_status{$v});
+  return sprintf($fmt, $printer_status{$v}) if defined($fmt);
+  return $printer_status{$v};
+}
+
+sub get_temps
+{
+  @response_queue=();
+  cmd('M105');
+  my @rsp=wait_response('^ok$');
+  my %values;
+  foreach my $r (@rsp) {
+     decode_status($r, \%values);
+     }
+  printf("Head Temp:%s\n", $values{'T'});
+  printf("Bed  Temp:%s\n", $values{'B'});
+  printf("File name:%s\n", $values{'F'});
+  printf("Extruder :%s\n", $values{'E'});
+  printf("Job \%   :%s\n", $values{'P'});
+}
+
+sub get_pos
+{
+  @response_queue=();
+  cmd('M114');
+  my @rsp=wait_response('^ok$');
+  my %values;
+  foreach my $r (@rsp) {
+     decode_status($r, \%values);
+     }
+  printf("Current Position: X:%s, Y:%s, Z:%s, E:%s\n",
+     $values{'X'}, $values{'Y'}, $values{'Z'}, $values{'E'});
+}
+
+#################################### Serial Port ####################
+
+sub openport
+{ my ($port, $baud)=@_;
+  
+  my $fh;
+
+eval { require Device::SerialPort; };
+if (!$@) {
+   $fh = Device::SerialPort->new($port, 0, undef);
+   &$message("Using Device::SerialPort\n") if $debug>1;
+   }
+else {
+   eval { require Win32::SerialPort; };
+   if (!$@) {
+	Win32API::CommPort::debug_comm($debug > 4 ? 1 : 0);
+	$fh = Win32::SerialPort->new($port, 0, undef);
+	&$message("Using Win32::SerialPort\n") if $debug>1;
+	}
+   else {
+	&$errormessage("Can't load either Device::SerialPort or Win32::SerialPort\n");
+	}
+   }
+
+if (!$fh) {
+   &$errormessage("Can't open port $port\n");
+   return undef;
+   }
+
+&$message("Port opened\n") if $debug>1;
+
+&$message("Configure Port %s\n", $port) if $debug>1;
+$fh->devicetype('Uniden BCD396XT Scanner');
+$fh->datatype('raw');
+
+$fh->are_match("\r","\n");
+$fh->rts_active(1);
+$fh->dtr_active(1);
+$fh->baudrate($baud);
+$fh->parity("none");
+$fh->databits(8);
+$fh->stopbits(1);
+$fh->handshake("none");
+#$fh->xon_char(0x11);
+#$fh->xoff_char(0x13);
+$fh->buffers(4096,4096);
+$fh->read_char_time(200);
+$fh->read_const_time(200);
+$fh->parity_enable(0);
+$fh->binary(1);
+
+$fh->debug($debug>3 ? 1 : 0);
+$fh->error_msg(1);
+
+if ($fh->write_settings()) {
+   &$message("Port configured OK\n");
+   }
+else {
+   &$errormessage("Unable to configure port\n");
+   }
+
+$fh->purge_all;   
+return $fh;
+}
+
+
+sub closeport
+{ my ($fh)=@_;
+
+  if ($fh) {
+     $fh->rts_active(0);
+     $fh->dtr_active(0);
+
+     undef $fh;
+     }
+  return undef;
+}
+
+####################################  ascii #################
+
+sub openscreen_ascii
+{
+}
+
+sub closescreen_ascii
+{
+}
+
+sub status_ascii
+{
+  printf @_;
+}
+
+sub message_ascii
+{
+  printf @_;
+}
+
+sub errormessage_ascii
+{
+  printf @_;
+}
+
+################################### Gtk2 ########################
+
+sub cb_cmd_activate
+{ my ($this) = @_;
+  my $c = $this->get_text;
+  
+  if ($c =~ /^port=(.+)/) {
+     $port=$1;
+     $trinus=closeport($trinus) if defined($trinus);
+     $trinus=openport($port, $baud);
+
+     # kick start the cmd_queue if needed
+     if (defined($trinus) && ($#cmd_queue>=0)) {
+        if ($cmd_queue[0] ne $cmd_queue_init_delay) {
+           icmd($cmd_queue_init_delay);
+           }
+        else {
+           $scanstate=SS_QUEUE_NEXT;
+           }
+        }
+     }
+  else {
+     cmd($c);
+     }
+
+  if ($c ne '') {
+     $this->set_text('');
+  
+     $cmd_combo->append_text($c);
+     # TODO: only add command to the dropdown box if not already there
+     #       OR remove previous copies of this command from the list
+     }
+}
+
+sub cb_cmd_popup
+{ my ($this) = @_;
+  $cmd_combo_isup=1;
+}
+
+sub cb_cmd_popdown # doesn't actually seem to work. not needed here anyway
+{ my ($this) = @_;
+  return TRUE;
+}
+
+sub cb_cmd_changed
+{ my ($this) = @_;
+  if ($cmd_combo_isup) {
+     }
+}
+
+
+sub toggle_handler
+{ my ($this, $event, $startcmd, $stopcmd)=@_;
+  if ($this->get_relief() eq 'normal') {
+     $this->set_relief('none');
+     cmd($startcmd);
+     }
+  else {
+     $this->set_relief('normal');
+     cmd($stopcmd);
+     }
+}
+
+sub cb_heatE_clicked { toggle_handler($_[0], $_[1], 'M104 S200', 'M104 S0'); }
+
+sub cb_heatB_clicked { toggle_handler($_[0], $_[1], 'M140 S60', 'M140 S0'); }
+
+sub cb_fan_clicked   { toggle_handler($_[0], $_[1], 'M106 S255', 'M106 S0'); }
+
+sub cb_sendFile_clicked
+{
+  my $filter=Gtk2::FileFilter->new();
+  $filter->set_name("GCode");
+  $filter->add_pattern("*.gcode");
+  $filter->add_pattern("*.gco");
+
+  my $allfiles=Gtk2::FileFilter->new();
+  $allfiles->set_name("All Files");
+  $allfiles->add_pattern("*.*");
+  
+  my $chooser = Gtk2::FileChooserDialog->new('Select GCode File', 
+                  undef, 'open', 'gtk-cancel'=>'cancel', 'gtk-ok'=>'ok');
+  $chooser->add_filter($filter);
+  $chooser->add_filter($allfiles);
+    
+  if ('ok' eq $chooser->run) {
+     read_gcode_file($chooser->get_filename);
+     }
+  $chooser->destroy;
+}
+
+sub cb_selectFile_clicked
+{ my ($this, $event)=@_;
+  my (@rsp,$in_list);
+  @response_queue=();
+  cmd('M20'); # get list of files on SD Card
+  @rsp=wait_response('^ok$');
+  
+  my $files=Gtk2::ListStore->new('Glib::String');
+  
+  $in_list=0;
+  foreach my $f (@rsp) {
+     if (!$f) { }
+     elsif ($f eq "Begin file list") { $in_list=1; }
+     elsif ($f eq "End file list") { $in_list=0; }
+     elsif ($in_list) {
+        #printf("File: %s\n", $f);
+        $files->set($files->append, 0, $f);
+        }
+     }
+  
+
+  # pop up a selection dialog for the user
+  my $renderer0 = Gtk2::CellRendererText->new;
+  $renderer0->set(editable=>FALSE);
+  my $column0 = Gtk2::TreeViewColumn->new_with_attributes("File Name", $renderer0, 'text'=>0);
+
+  my $treeview = Gtk2::TreeView->new($files);
+  $treeview->append_column($column0);
+    
+  my $sw=Gtk2::ScrolledWindow->new;
+  $sw->set_policy('never','always');
+  $sw->set_shadow_type('in');
+#  $sw->set_size_request(250,100);
+  $sw->add($treeview);
+  
+  my $dlg=Gtk2::Dialog->new('Select SD Card File', $displaywin, 'modal', 'Cancel'=>'cancel', 'Ok'=>'ok');
+  $dlg->set_default_response('ok');
+  $dlg->set_size_request(300,250);
+  
+  $dlg->get_content_area()->add($sw);
+  $dlg->get_content_area()->show_all();
+    
+  my $response = $dlg->run;
+  if ($response eq 'ok') {
+     my $sel = $treeview->get_selection;
+     my @sel = $sel->get_selected_rows;
+     
+     if (scalar @sel) {
+        my $fn = $files->get($files->get_iter($sel[0]), 0);
+        #printf("Selected file:%s\n", $fn);
+        cmd('M23 '.$fn);
+        }
+     else {
+        #printf("Nothing selected\n");
+        }
+     }
+  $dlg->destroy;
+}
+
+sub cb_startPrint_clicked  { cmd('M24'); }
+
+sub cb_stopPrint_clicked   { cmd('M53'); }
+
+sub cb_pausePrint_clicked  { cmd('M25'); }
+
+sub cb_resumePrint_clicked { cmd('M52'); }
+
+sub cb_home_clicked        { cmd('G28'); }
+
+sub cb_status_clicked
+{
+  my @rsp;
+  @response_queue=();
+  # just execute all useful Get Status type commands
+  if (1) {
+     foreach my $c (qw/M105 M114 M115 M632 M500/) {
+        qcmd($c);
+        }
+     qcmd('+0.5');
+     }
+  else {
+     cmd('M105'); 
+     @rsp=wait_response('^ok$');
+     cmd('M114'); 
+     @rsp=wait_response('^ok$');
+     cmd('M115'); 
+     @rsp=wait_response('^ok$');
+     cmd('M500'); 
+     @rsp=wait_response('^ok$');
+     cmd('M632'); 
+     @rsp=wait_response('^ok$');
+     }
+}
+
+sub cb_offset_clicked
+{ my ($this, $event)=@_;
+  $cmd_combo->grab_focus();
+  $cmd_combo->child->set_text('M628 Z0.0');
+  $cmd_combo->child->set_position(6);
+  
+  # TODO: Read the current offsets and open a dialog with entry boxes in it.
+}
+
+sub cb_laser_clicked
+{ my ($this, $event) = @_;
+  my @rsp;
+  
+  #TODO: prompt with a dialog to confirm
+
+  my $mb = Gtk2::MessageDialog->new($displaywin, 'destroy-with-parent', 
+               'question', 'ok-cancel',
+               "This check will turn the laser on for about 1 second.\n\n".
+               "It can be used to check your laser is close to correct focus\n\n".
+               'Make sure it is properly installed on the Trinus head and pointed '.
+               'at a target such as a piece of wood or several layers of paper then '.
+               'click OK');
+  if ('ok' eq $mb->run) {
+     @response_queue=();
+     cmd("M629 C0"); # LASER mode
+     @rsp=wait_response('^ok$');
+     cmd("M630 C1"); # LASER On
+     @rsp=wait_response('^ok$');
+     sleep(1);
+     cmd("M630 C0"); # LASER Off
+     @rsp=wait_response('^ok$');
+     cmd("M629 C1"); # FDM mode
+     @rsp=wait_response('^ok$');
+     }
+  $mb->destroy;
+}
+
+
+sub home
+{
+  ($head_x, $head_y, $head_z, $head_e)=(0,0,0,0);
+  qcmd("G28");
+}
+
+sub moveto
+{ my ($x, $y, $z)=@_;
+  my $c="G0";
+  if (defined($x)) {
+     $c.=sprintf(" X%1.5f", $x);
+     $head_x=$x;
+     }
+  if (defined($y)) {
+     $c.=sprintf(" Y%1.5f", $y);
+     $head_y=$y;
+     }
+  if (defined($z)) {
+     $c.=sprintf(" Z%1.5f", $z);
+     $head_z=$z;
+     }
+  qcmd($c);
+}
+
+sub lineto($$$$)
+{ my ($x, $y, $z, $power)=@_;
+  my $c="G1";
+  if (defined($x)) {
+     $c.=sprintf(" X%1.5f", $x);
+     }
+  else {
+     $x = $head_x;
+     }
+     
+  if (defined($y)) {
+     $c.=sprintf(" Y%1.5f", $y);
+     }
+  else {
+     $y = $head_y;
+     }
+     
+  if (defined($z)) {
+     $c.=sprintf(" Z%1.5f", $z);
+     }
+  else {
+     $z = $head_z;
+     }
+     
+  if ((length($c) > 2) && defined($power) && ($power>0)) {
+     my $len = sqrt(($x-$head_x)**2 + ($y-$head_y)**2 + ($z - $head_z)**2);
+     #printf "len=%1.5f  power=%1.2f\n", $len, $power;
+     $head_e += $len * $power;
+     $c.=sprintf(" E%1.5f", $head_e);
+     }
+  qcmd($c);
+
+  $head_x=$x;
+  $head_y=$y;
+  $head_z=$z;
+}
+
+
+sub cb_laserFocus_clicked
+{ my ($this, $event) = @_;
+  my $msg=<<EOF;
+This test checks your Laser focus by drawing five 10mm lines from different heights - 120, 110, 100, 90 and 80mm.
+Your laser is focussed correctly if the middle section of the line (drawn from 100mm high) cuts the top sheet of paper cleanly.
+If more than one section is cut, it is usually better that the 4th section (drawn from 90mm) is cut as that allows for thicker items to be engraved without adjusting the focus.
+
+Place at least two layers of 80gsm (normal A4) paper on the bed and press OK to run the test.
+EOF
+
+  my $mb = Gtk2::MessageDialog->new($displaywin, 'destroy-with-parent', 
+               'question', 'ok-cancel', $msg);
+  if ('ok' eq $mb->run) {
+     laser_focus();
+     }
+  $mb->destroy;
+}
+
+sub cb_laserPower_clicked
+{ my ($this, $event) = @_;
+  my $msg=<<EOF;
+This test checks your laser power and how it affects the test material by drawing a power test chart starting at the minimum power set below and increasing by step every 5mm.
+The default values are good for 80gsm (normal A4) paper.
+
+Place at least two layers of test material on the bed and press OK to run the test.
+EOF
+  my $mb = Gtk2::MessageDialog->new($displaywin, 'destroy-with-parent', 
+               'question', 'ok-cancel', $msg);
+
+  my $hbox = Gtk2::HBox->new();
+  my $power= Gtk2::SpinButton->new_with_range(0.1, 10, 0.1);
+  my $step = Gtk2::SpinButton->new_with_range(0.1,  1, 0.1);
+
+  $power->set_value(0.5);
+  $step->set_value(0.1);
+
+  $hbox->pack_end($step, FALSE, FALSE, 0);
+  $hbox->pack_end(Gtk2::Label->new('Step'), FALSE, FALSE, 0);
+  $hbox->pack_end($power, FALSE, FALSE, 0);
+  $hbox->pack_end(Gtk2::Label->new('Minimum Power'), FALSE, FALSE, 0);
+
+  $hbox->show_all();
+  $mb->get_content_area()->add($hbox);
+
+  if ('ok' eq $mb->run) {
+     #  minpower, powerstep, yofs, zofs (relative to 100)
+     laser_speed($power->get_value(), $step->get_value(), 50, 0);
+     }
+  $mb->destroy;
+}
+
+sub laser_focus
+{ 
+  my ($x,$y,$z)=(30, 50, 120); # Start point
+  my $travelrate=9000; # max 9000mm/sec
+  my $laser_power=2.0;
+  
+#  &$errormessage("Laser focus start\n");
+
+  qcmd("M200 S0");
+  home();
+  qcmd("M629 C0"); # LASER mode
+  qcmd("G0 F".$travelrate);
+  moveto($x, $y, $z); # Move to start
+  
+  while ($z>=80) {
+      qcmd("M200 S".sprintf("%d",((130-$z)/60*100)) ); # update progress meter
+      moveto(undef, undef, $z);
+      $x += 10;
+      lineto($x, undef, undef, $laser_power);
+      $z -= 10;
+      }
+
+  qcmd("M200 S100");
+  moveto(0, 120, undef); # Offer the piece to the user :-)
+#  qcmd("M629 C1"); # FDM mode
+  
+#  &$errormessage("Laser focus commands queued\n");
+}
+
+
+
+sub laser_speed
+{ my ($_minpower, $_powerstep, $_yofs, $_zofs)=@_;
+
+  my ($xofs,$yofs,$z)=(1, 50, 100); # Start Point
+  my ($x, $y)     =(0,0);
+  my $travelrate  =9000; # max 9000mm/sec
+  my $maxwidth    =60;
+  my $samplesize  = 5;  # mm
+  my $sampleheight= 3;  # mm
+  my $minpower    =0.4;
+  my $powerstep   =0.1;
+  my $linespacing =0.2;
+  my $overscan    =0.3; # mm
+
+  $minpower =$_minpower  if defined($_minpower);
+  $powerstep=$_powerstep if defined($_powerstep);
+  $yofs     =$_yofs      if defined($_yofs);
+  $z       +=$_zofs      if defined($_zofs);
+  my $markerpower =$minpower + ($powerstep * 8);  
+  
+  qcmd("M200 S0");
+  home();
+  qcmd("M629 C0"); # LASER mode
+  qcmd("G0 F".$travelrate);
+  moveto(undef, undef, $z); # Move to height
+
+  my $maxx = $maxwidth-$xofs-$samplesize;
+  $maxx = (int($maxx / $samplesize)+1) * $samplesize;
+  
+  while ($y <= $sampleheight) {
+     $x=0;
+     
+     qcmd(sprintf("M200 S%d", $y/$sampleheight*100));
+     
+     # go to start of next line less a bit of overscan.
+     # this makes sure the head is moving when the laser comes on.
+     moveto($xofs+$x-$overscan, $yofs+$y, undef);
+     
+     # Approach start of burn with laser at minimum power
+     lineto($xofs+$x, undef, undef, $minpower);
+
+     while ($x < $maxx) {
+        $x+=$samplesize;
+        lineto($xofs+$x, undef, undef, $minpower + ($x/$samplesize*$powerstep));
+        }
+        
+     # probably doesn't need it at end of line, but overscan just in case
+     moveto($xofs+$x+$overscan, undef, undef);
+     $y+=$linespacing;
+     }
+
+  # now draw a box around the whole thing
+  moveto($xofs-0.5, $yofs-0.5, $z);
+  lineto($xofs+$maxx+0.5, $yofs-0.5,               undef, $markerpower);
+  lineto($xofs+$maxx+0.5, $yofs+$sampleheight+0.5, undef, $markerpower);
+  lineto($xofs-0.5,       $yofs+$sampleheight+0.5, undef, $markerpower);
+  lineto($xofs-0.5,       $yofs-0.5,               undef, $markerpower);
+  
+  # and tick marks for each change in power
+  $x=0;
+  while ($x <= $maxx) {
+     moveto($xofs+$x, $yofs);
+     lineto($xofs+$x, $yofs-3, undef, $markerpower);
+     $x += $samplesize;
+     }
+     
+  qcmd("M200 S100");
+  qcmd("G0 X0 Y120"); # Offer the piece to the user :-)
+#  qcmd("M629 C1"); # FDM mode
+}
+
+
+# return the extrusion multiplier
+#    ie how much should the extruder move the filament in
+#    to get 1mm of material at the specified size.
+# Inputs:
+#    Extrusion width and height (required output volume)
+#    Nozzle diameter (to limit the extrusion width)
+#    Filament diameter (input volume)
+sub calc_extrude_rate($$$$)
+{ my ($ew, $eh, $n, $f)=@_;
+  my $farea = 3.1415 * ($f/2)**2;
+  
+  $ew=$n*2 if $ew > ($n*2); # limit max width to 2*nozzle
+  $eh=$n   if $eh > $n;     # limit max layer to nozzle
+  my $earea = $ew * $eh;
+  
+  printf("calc_extrude_rate(%1.3f,%1.3f,%1.1f,%d): %1.5f\n", 
+      $ew, $eh, $n, $f, $earea/$farea);
+  return $earea / $farea;
+}
+
+
+sub arc_test
+{
+  # Draw a sine wave. 
+  my $temp=200; # 0=laser mode, >0 = extruder head temp
+  
+                 # pi * d = circumference, of which we want half
+  my $arclen = 3.1415 * 20;
+  my $pwr=0;
+  my $e=0;
+  my $layer=1;
+  my $layersize=0.3;
+  my $nozzlesize=0.4;
+  my $filamentsize=1.75;
+  my $feedrate=30*60; # feed at 30mm/sec = 1800mm/minute
+  my $retract=4.5;
+  
+  printf("arclen=%1.2fmm\n", $arclen);
+  
+  if ($temp) {
+     $pwr = calc_extrude_rate(0.5, $layersize, $nozzlesize, $filamentsize);
+     qcmd("M629 C1");      # temp control on
+     qcmd("M104 S".$temp); # set head temp
+     }
+  else {
+     $pwr = 0.6;
+     qcmd("M629 C0");      # temp control off
+     }
+  home();
+  qcmd(sprintf("G1 F%d", $feedrate));
+  if ($temp) {
+     qcmd("G0 Z30");                                   # lift clear of the bed for heating
+     qcmd(sprintf("M109 S%d R%d", $temp, $temp*1.03)); # wait for head to reach temp
+     $e+=$retract;
+     qcmd(sprintf("G1 E%1.6f",$e));                    # unretract
+     qcmd("M106 S200");                                # start the work cooling fan
+     qcmd(sprintf("G0 X10 Y30 Z%1.2f", $layersize));   # go to start of pre-flow
+     $e += 20 * $pwr;
+     qcmd(sprintf("G1 Y50 E%1.5f", $e));               # feed to start of arc
+     }
+  else {
+     qcmd(sprintf("G0 X10 Y50 Z%1.2f", 100));          # go to start of arc
+     }
+
+  for $layer (1..($temp ? 3 : 1)) {
+     qcmd(sprintf("G0 Z%1.5f", $layer * $layersize)) if $temp; # set work height
+
+     $e += $arclen*$pwr;
+     qcmd(sprintf("G2 X50 Y50 I20 J0 E%1.5f F%d",$e,$feedrate)); # first arc
+
+     # Firmware 3.5.6 does not implement G3:CCW Arc! (or it's buggy)
+     if (1) { # properly - G2 + G3
+        #$e += $arclen*$pwr;
+        #qcmd(sprintf("G3 X90 Y50 I20 J0 E%1.5f F%d",$e,$feedrate)); # second arc from end of first
+
+        # back to centre
+        #$e += 40 * $pwr;
+        #qcmd(sprintf("G1 X50 Y50 E%1.5f", $e));
+        }
+     else { # fudge it with 2xG2
+        $e += 40 * $pwr;
+        qcmd(sprintf("G1 X90 Y50 E%1.5f", $e));   # go to start of second arc
+
+        $e += $arclen*$pwr;
+        qcmd(sprintf("G2 X50 Y50 I-20 J0 E%1.5f F%d",$e,$feedrate));# second arc
+        }
+
+     # back to start
+     $e += 40 * $pwr;
+     qcmd(sprintf("G1 X10 Y50 E%1.5f", $e));
+     }
+     
+  # finish up
+  if ($temp) {
+     qcmd(sprintf("G1 E%1.5f", $e-$retract)); # retract
+     qcmd("G0 X50");                  # wipe
+     qcmd("G0 Z30");	              # get clear of the work
+     qcmd("G0 Y100");                 # "eject"
+     qcmd("M400");                    # wait for everything to be done
+     #qcmd("M108");                    # cancel extruder temp wait
+     qcmd("M104 S0");                 # stop heating extruder
+     qcmd("M106 S0");                 # stop the work fan
+     }
+  else {
+     qcmd("G0 Y100");
+     }
+}
+
+# try lots of parameters to a command to see if we get a response
+# probably not needed now that most commands have been identified
+sub test_commands
+{ my ($cmd)=@_;
+  my @rsp;
+  @response_queue=();
+  foreach my $l (qw/A B C D E F G H I J K L M N O P Q R S T U V W X Y Z/) {
+     cmd($cmd.' '.$l.'1');
+     @rsp = wait_response('^ok$');
+     }
+}
+
+sub cb_test_clicked
+{ my ($this, $event)=@_;
+#  test_commands('M610');
+#  test_commands('M650');
+
+#  test_commands('M107');
+#  test_commands('M206');
+#  test_commands('M302');
+#  test_commands('M400');
+#  test_commands('M401');
+
+#  test_commands('M500');
+#  test_commands('M501');
+#  test_commands('M17');
+
+          # minpower, powerstep, yofs, zofs
+   #laser_speed(0.4, 0.1, 50, 0);  # paper
+   #laser_speed(0.4, 0.5, 50, 0);  # 
+   #laser_speed(5.0, 0.6, 50, 3);  # back of eartag
+   
+#   get_temps();
+#   get_pos();
+   arc_test();
+}
+
+sub cb_clearmsg_clicked
+{ my ($this, $event)=@_;
+  $messagewin->set_text('');
+}
+
+sub cb_scancommands_clicked
+{ my ($this, $event)=@_;
+
+  # let cb_idle know we are scanning
+  if ($scanstate == SS_NONE) {
+     $scanstate = SS_NEXT;
+     #$this->set_relief('half');
+     $this->set_label('Stop');
+     }
+  else {
+     $scanstate = SS_NONE;
+     #$this->set_relief('normal');
+     $this->set_label('Scan');
+     }
+}
+
+sub cb_idle
+{ my ($data)=@_;
+
+  # check if scanning, and if we are ok to send the next command
+  # then send it. Let the RX handler deal with the response
+
+  if ($scanstate==SS_QUEUE_NEXT) {
+     if (scalar @cmd_queue>0) {
+        my $c = shift @cmd_queue;
+        if ($c =~ /^\+/) {
+           $ss_wait_start = time()+substr($c,1);
+           $scanstate=SS_QUEUE_SLEEP;
+           }
+        elsif ($c =~ /^\&/) {
+           cmd(substr($c,1));
+           $scanstate=SS_QUEUE_WAIT;
+           }
+        else {
+           if ($c =~ /^M200.*S(\d{1,3})/ ) {
+              $printer_status{'_progress'} = $1;
+              $printer_status{'_updated'} = 1;
+              }
+           cmd($c);
+           $scanstate=SS_QUEUE_WAIT;
+           }
+        #&$errormessage("Scan State: SS_QUEUE_%s via next command\n",
+        #               $scanstate==SS_QUEUE_WAIT ? "WAIT" : "SLEEP");
+        }
+     else {
+        &$message("CMD Queue Complete\n");
+        $scanstate=SS_NONE;
+        }
+     }
+  elsif ($scanstate==SS_QUEUE_WAIT) {
+     if ($ss_wait_start==0) {
+        $ss_wait_start = time();
+        }
+     elsif (time() > ($ss_wait_start + CMD_TIMEOUT)) {
+        $scanstate = SS_QUEUE_NEXT;
+        $ss_wait_start = 0;
+        #&$errormessage("Scan State: SS_QUEUE_NEXT via CMD_TIMEOUT\n");
+        }
+     }
+  elsif ($scanstate==SS_QUEUE_SLEEP) {
+     if (time() > $ss_wait_start) {
+        $scanstate = SS_QUEUE_NEXT;
+        $ss_wait_start=0;
+        #&$errormessage("Scan State: SS_QUEUE_NEXT via sleep done\n");
+        }
+     }
+     
+  elsif ($scanstate==SS_NEXT) {
+     # time to send the next code
+     my $c = $cmd_combo->child->get_text;
+     if ($c =~ /([GM])(\d{1,3})/ ) {
+        my $cmd=$1;
+        my $x=$2 + 1;
+        while (defined($known_commands{$cmd.$x})) {
+              $x++;
+              }
+        my $newc = $cmd.$x;
+        $scan_goterror=0;
+        cmd($c);
+        $cmd_combo->child->set_text($newc);
+        $scanstate = SS_WAIT;
+        }
+     else {
+        $scanstate = SS_NONE;
+        #$scancommands_btn->set_relief('normal');
+        $scancommands_btn->set_label('Scan');
+        }
+     }
+  elsif ($scanstate==SS_WAIT) {
+     # waiting for a response
+     if ($ss_wait_start==0) {
+        $ss_wait_start = time();
+        }
+     elsif (time() > ($ss_wait_start + 0.5)) {
+        $scanstate = SS_NEXT;
+        $ss_wait_start = 0;
+        }
+     }
+
+  # send a request to get position and progress every 10 seconds
+  # RX handler can handle it
+  if (time() > $last_progress_update+10)
+  {
+    if($last_progress_update != 0)
+    {
+      cmd("M105");  # TODO: do I want to queue this? probably
+                    # TODO: also, need to update the XYZ position
+                    #       cannot have 2 cmds sequentially
+    }
+    else
+    { # need to 'click' get status once to pull up the status bar
+      # TODO: find a less hack-ey way to do this
+      cb_status_clicked;
+    }
+    $last_progress_update = time();
+  }
+     
+  if ((time() > $last_status_update+0.5) &&
+      defined($printer_status{'_updated'}) &&
+      $printer_status{'_updated'}
+     ) {
+     $last_status_update=time(); 
+     $printer_status{'_updated'}=0;
+     my $st='';
+     if (defined($printer_status{'_progress'})) {
+        $st .= sprintf("%3d%%%%  ", $printer_status{'_progress'});
+        }
+     if (defined($printer_status{'pos.X'})) {
+        $st .= sprintf("X:%s Y:%s Z:%s   Head:%s   Bed:%s   Job:%s/%s", 
+              get_value('pos.X', '%1.2f'),
+              get_value('pos.Y', '%1.2f'),
+              get_value('pos.Z', '%1.2f'),
+              get_value('temp.T'),
+              get_value('temp.B'),
+              get_value('temp.P'),
+              get_value('temp.F'),
+              );
+        }
+
+     &$status($st);
+     if (0) {
+        printf("============================\n");
+        foreach my $k (sort keys %printer_status) {
+           printf("   %s=%s\n", $k, $printer_status{$k});
+           }
+        }
+     }
+     
+  return TRUE;
+}
+
+
+sub openscreen_gtk2
+{
+  Gtk2->init;
+  my ($messagetext, $messagescroller, $statusbox, $clearmsg_btn);
+  my ($bheatE, $bheatB, $bfan, $bhome, $blaser, $bsendFile,
+      $bselectFile, $bstartPrint, $bstopPrint, $bpausePrint, $bresumePrint,
+      $boffset, $bstatus, $blaserFocus, $blaserPower, $btest);
+  my ($leftlayout, $rightlayout, $hbox);
+     
+  $displaywin = Gtk2::Window->new('toplevel');
+  $displaywin->set_title('TRINUS 3D Printer Console');
+  $displaywin->signal_connect(destroy => sub {Gtk2->main_quit;});
+  
+  $messagetext = new Gtk2::TextView;
+  $messagetext->set(editable=>FALSE);
+  $messagewin=$messagetext->get_buffer;
+  $messagewin->signal_connect(insert_text=>sub{
+        $messagetext->scroll_to_iter($messagewin->get_end_iter,0.0,TRUE,0.0,1.0)
+        });
+        
+  $messagescroller=Gtk2::ScrolledWindow->new;
+  $messagescroller->set_policy('automatic','automatic');
+  $messagescroller->set_shadow_type('in');
+  $messagescroller->set_size_request(300,400);
+  $messagescroller->add($messagetext);
+  
+  $scancommands_btn = Gtk2::Button->new('Scan');
+  $scancommands_btn->signal_connect(clicked=>\&cb_scancommands_clicked);
+  $clearmsg_btn = Gtk2::Button->new('Clear');
+  $clearmsg_btn->signal_connect(clicked=>\&cb_clearmsg_clicked);
+  
+
+  $statuswin = Gtk2::Label->new;
+  $statuswin->set_single_line_mode(TRUE);
+
+  $statusbox = Gtk2::HBox->new(FALSE,0);  
+  $statusbox->pack_start($statuswin, FALSE, FALSE, 20);
+  $statusbox->pack_end($scancommands_btn, FALSE, FALSE, 0) if $devmode;
+  $statusbox->pack_end($clearmsg_btn, FALSE, FALSE, 0);
+  
+  $cmd_combo = Gtk2::ComboBoxEntry->new_text;
+  $cmd_combo->signal_connect(changed=>\&cb_cmd_changed);
+  $cmd_combo->signal_connect(popup=>\&cb_cmd_popup);
+  $cmd_combo->signal_connect(popdown=>\&cb_cmd_popdown);
+  $cmd_combo->child->signal_connect(activate=>\&cb_cmd_activate);
+  
+  $cmd_combo->child->set_width_chars(60);
+  $cmd_combo->child->set_max_length(255);
+  $cmd_combo->child->set_text('');
+  
+  $leftlayout = Gtk2::VBox->new(FALSE, 0);
+  $leftlayout->pack_start($messagescroller, TRUE, TRUE, 0);
+  $leftlayout->pack_start($cmd_combo, FALSE, FALSE, 0);
+  $leftlayout->pack_end($statusbox, FALSE, FALSE, 0);
+
+  $rightlayout = Gtk2::VBox->new(FALSE, 0);
+
+  $bheatE = Gtk2::Button->new('Heat E');
+  $bheatE->signal_connect(clicked=>\&cb_heatE_clicked);
+  $bheatB = Gtk2::Button->new('Heat B');
+  $bheatB->signal_connect(clicked=>\&cb_heatB_clicked);
+  $bfan = Gtk2::Button->new('Fan');
+  $bfan->signal_connect(clicked=>\&cb_fan_clicked);
+  $bsendFile = Gtk2::Button->new('Send File');
+  $bsendFile->signal_connect(clicked=>\&cb_sendFile_clicked);
+
+  $bselectFile = Gtk2::Button->new('Select SD File');
+  $bselectFile->signal_connect(clicked=>\&cb_selectFile_clicked);
+  $bstartPrint = Gtk2::Button->new('Start SD Print');
+  $bstartPrint->signal_connect(clicked=>\&cb_startPrint_clicked);
+  $bstopPrint = Gtk2::Button->new('Stop SD Print');
+  $bstopPrint->signal_connect(clicked=>\&cb_stopPrint_clicked);
+  $bpausePrint = Gtk2::Button->new('Pause SD Print');
+  $bpausePrint->signal_connect(clicked=>\&cb_pausePrint_clicked);
+  $bresumePrint = Gtk2::Button->new('Resume SD Print');
+  $bresumePrint->signal_connect(clicked=>\&cb_resumePrint_clicked);
+
+  $bhome  = Gtk2::Button->new('Home');  
+  $bhome->signal_connect(clicked=>\&cb_home_clicked);
+  $bstatus  = Gtk2::Button->new('Get Status');  
+  $bstatus->signal_connect(clicked=>\&cb_status_clicked);
+  $boffset  = Gtk2::Button->new('Offsets');  
+  $boffset->signal_connect(clicked=>\&cb_offset_clicked);
+
+  $blaser = Gtk2::Button->new('Laser Check');
+  $blaser->signal_connect(clicked=>\&cb_laser_clicked);
+  $blaserFocus = Gtk2::Button->new('L:Focus Check');
+  $blaserFocus->signal_connect(clicked=>\&cb_laserFocus_clicked);
+  $blaserPower = Gtk2::Button->new('L:Power Test');
+  $blaserPower->signal_connect(clicked=>\&cb_laserPower_clicked);
+
+  $btest    = Gtk2::Button->new('Test');  
+  $btest->signal_connect(clicked=>\&cb_test_clicked);
+
+  $rightlayout->pack_start($bheatE, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bheatB, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bfan, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bsendFile, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bselectFile, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bstartPrint, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bstopPrint, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bpausePrint, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bresumePrint, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bhome, FALSE, FALSE, 0);
+  $rightlayout->pack_start($bstatus, FALSE, FALSE, 0);
+  $rightlayout->pack_start($boffset, FALSE, FALSE, 0);
+  $rightlayout->pack_start($blaser, FALSE, FALSE, 0);
+  $rightlayout->pack_start($blaserFocus, FALSE, FALSE, 0);
+  $rightlayout->pack_start($blaserPower, FALSE, FALSE, 0);
+
+  $rightlayout->pack_start($btest, FALSE, FALSE, 0) if $devmode;
+
+  $hbox = Gtk2::HBox->new(FALSE, 0);
+  $hbox->pack_start($leftlayout, TRUE, TRUE, 0);
+  $hbox->pack_start($rightlayout, FALSE, FALSE, 0);
+  
+  $displaywin->add($hbox);
+  $cmd_combo->grab_focus();
+  $displaywin->show_all;
+  
+  Glib::Idle->add(\&check_rx);
+  Glib::Idle->add(\&cb_idle);
+}
+
+sub closescreen_gtk2
+{
+}
+
+sub status_gtk2
+{
+  my $fmt=shift;
+  my $str=sprintf($fmt, @_);
+  $statuswin->set_text($str);
+}
+
+sub message_gtk2
+{
+  my $fmt=shift;
+  my $str=sprintf($fmt, @_);
+  $messagewin->insert($messagewin->get_end_iter, $str);
+}
+
+sub errormessage_gtk2
+{
+  my $fmt=shift;
+  my $str=sprintf($fmt, @_);
+  #$str = sprintf("%s %s",logstamp(),$str);
+  $messagewin->insert($messagewin->get_end_iter, $str);
+  print $str;
+}
+
+
+########################################## RX Handlers ################
+  
+
+sub rx_handler
+{ my ($l)=@_;
+  push @response_queue, $l;
+  if ($l =~ /^\[ERROR\] /) {
+     $scan_goterror=1 if $scanstate!=SS_NONE;
+     &$errormessage($l."\n") if $scanstate==SS_NONE || $scan_printall;
+     if ($scanstate==SS_QUEUE_WAIT) {
+        # If there was an error transmitting the command
+        # re-transmit it by inserting it at the head of the queue
+        # along with a +3 command to sleep for 3 seconds
+        my $resend=0;
+        if ($l =~ /invalid checksum/) {
+           $resend = 1;
+           }
+        elsif ($l =~ /invalid gcode/) {
+           $resend = 1;
+           }
+           
+        if ($resend) {
+           icmd($lastcmd);
+           icmd('+3');
+           }
+        else {
+           $scanstate=SS_NONE;
+           &$errormessage("CMD Queue aborted due to error\n");
+           cmd("S630 S0"); # Laser Off, FDM Mode just in case
+           cmd("S629 S1");
+           }
+        }
+     }
+  elsif ($l eq 'ok') {
+     if (($scanstate==SS_WAIT) || ($scanstate==SS_NEXT)) {
+        printf("Scan Hit: %s", $lastcmd) unless $scan_goterror;
+        $lastcmd='';
+        $scanstate=SS_NEXT;
+        }
+     elsif (($scanstate==SS_QUEUE_WAIT) || ($scanstate==SS_QUEUE_NEXT)) {
+        $scanstate = SS_QUEUE_NEXT;
+        $ss_wait_start=0;
+        #&$errormessage("Scan State: SS_QUEUE_NEXT via ok\n");
+        }
+     &$message($l."\n") if $scanstate==SS_NONE || $scan_printall;
+     }
+  else {
+     if ($l =~ /^\[VALUE\] /) {
+        if ($lastcmd =~ /^M105/) {  # get temps
+           decode_status($l, \%printer_status, 'temp.');
+           #&$status("Head:%s Bed:%s", $printer_status{'temp.T'}, $printer_status{'temp.B'});
+           }
+        elsif ($lastcmd =~ /^M114/) {  # get position
+           if ($l =~ /^\[VALUE\] X:/) {
+              decode_status($l, \%printer_status, 'pos.');
+              #&$status("X:%s Y:%s Z:%s E:%s", $values{'X'}, $values{'Y'}, $values{'Z'}, $values{'E'});
+              }
+           else {
+              # x.min=/y.min=/z.min=
+              decode_value($l, \%printer_status);
+              }
+           }
+        elsif ($lastcmd =~ /^M115/) {  # get firmware version
+           if ($l =~ /^\[VALUE\] (.*)/ ) {
+              $printer_status{'firmware'}=$1;
+              $printer_status{'_updated'}=1;
+              }
+           }
+        elsif ($lastcmd =~ /^M632/) {  # Get Print status
+           # xxxxxx=yyyyy
+           decode_value($l, \%printer_status);
+           }
+        }
+     elsif ($l =~ /^\[ECHO\] /) {
+        if ($lastcmd =~ /^M500/) {  # get model
+           if ($l =~ /Stroke x:(.+?),y:(.+?),z:(.+)$/ ) {
+              $printer_status{'size.X'} = $1;
+              $printer_status{'size.Y'} = $2;
+              $printer_status{'size.Z'} = $3;
+              $printer_status{'_updated'}=1;
+              }
+           elsif ($l =~ /Machine Model : (.+)/ ) {
+              $printer_status{'model'}=$1;
+              $printer_status{'_updated'}=1;
+              }
+           }
+        }
+     &$message($l."\n");
+     }
+}
+
+
+sub check_rx
+{
+  return 1 if $in_check_rx;
+  return 1 unless defined($trinus);
+  $in_check_rx=1;
+
+  my $rxdata = $trinus->lookfor;
+  if (defined($rxdata)) {
+     my @lines = split(/[\r\n]/,$rxdata);
+     foreach my $l (@lines) {
+        rx_handler($l) if length($l);
+        }
+     }
+  
+  $in_check_rx=0;
+  return 1;
+}
